@@ -1,0 +1,15 @@
+﻿using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace TaxiApp.Backend.Core.DTO_S
+{
+    public class AssignVehicleDto
+    {
+        [Required]
+        public required string DriverId { get; set; }
+    }
+}

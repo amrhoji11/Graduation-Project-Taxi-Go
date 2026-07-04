@@ -1,0 +1,786 @@
+﻿using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using TaxiApp.Backend.Core.DTO_S;
+using TaxiApp.Backend.Core.Interfaces;
+using TaxiApp.Backend.Core.Models;
+using TaxiApp.Backend.Infrastructure.Data;
+using TaxiApp.Backend.Infrastructure.Helper;
+
+namespace TaxiApp.Backend.Infrastructure.Repositories
+{
+    public class AdminRepository : IAdminRepository
+    {
+        private readonly ApplicationDbContext context;
+        private readonly UserManager<ApplicationUser> userManager;
+        private readonly IMapService mapService;
+
+        // Straight-line fallback only - used for the ETA estimate whenever
+        // the real Distance Matrix call is unavailable (no/placeholder API
+        // key, request failure). Generic urban driving average.
+        private const double FallbackSpeedMetersPerSecond = 8.33; // ~30 km/h
+
+        public AdminRepository(ApplicationDbContext _context, UserManager<ApplicationUser> userManager, IMapService mapService)
+        {
+            context = _context;
+            this.userManager = userManager;
+            this.mapService = mapService;
+        }
+
+        public async Task<bool> UpdateAdminProfileAsync(string userId, UpdateAdminProfileDto request)
+        {
+            var user = await userManager.FindByIdAsync(userId);
+            if (user == null)
+                return false;
+
+            // تعديل الاسم الأول والاسم الثاني
+            if (!string.IsNullOrWhiteSpace(request.FirstName))
+                user.FirstName = request.FirstName;
+
+            if (!string.IsNullOrWhiteSpace(request.LastName))
+                user.LastName = request.LastName;
+
+           
+
+            var updateResult = await userManager.UpdateAsync(user);
+            if (!updateResult.Succeeded)
+                return false;
+
+            // تعديل العنوان
+            if (request.RemoveAddress)
+                user.Address = null;
+            else if (!string.IsNullOrWhiteSpace(request.Address))
+                user.Address = request.Address;
+
+            // تعديل الصورة الشخصية
+            var folderPath = Path.Combine(Directory.GetCurrentDirectory(), "Images");
+
+            if (!Directory.Exists(folderPath))
+                Directory.CreateDirectory(folderPath);
+
+            if (request.RemoveProfilePhoto)
+            {
+                if (!string.IsNullOrEmpty(user.ProfilePhotoImg))
+                {
+                    var oldPath = Path.Combine(folderPath, user.ProfilePhotoImg);
+                    if (System.IO.File.Exists(oldPath))
+                        System.IO.File.Delete(oldPath);
+                }
+
+                user.ProfilePhotoImg = null;
+            }
+            else if (request.ProfilePhotoImg != null && request.ProfilePhotoImg.Length > 0)
+            {
+                var allowedExtensions = new[] { ".jpg", ".jpeg", ".png" };
+                var extension = Path.GetExtension(request.ProfilePhotoImg.FileName).ToLower();
+
+                if (!allowedExtensions.Contains(extension))
+                    return false;
+
+                var fileName = Guid.NewGuid() + extension;
+                var filePath = Path.Combine(folderPath, fileName);
+
+                using var stream = System.IO.File.Create(filePath);
+                await request.ProfilePhotoImg.CopyToAsync(stream);
+
+                if (!string.IsNullOrEmpty(user.ProfilePhotoImg))
+                {
+                    var oldPath = Path.Combine(folderPath, user.ProfilePhotoImg);
+                    if (System.IO.File.Exists(oldPath))
+                        System.IO.File.Delete(oldPath);
+                }
+
+                user.ProfilePhotoImg = fileName;
+            }
+
+            await context.SaveChangesAsync();
+
+            return true;
+        }
+
+        public async Task<ApplicationUser?> GetAdminProfileAsync(string adminId)
+        {
+            return await userManager.FindByIdAsync(adminId);
+        }
+
+        public async Task<bool> SoftDeleteDriverAsync(string driverId)
+        {
+            var user = await context.Users.FirstOrDefaultAsync(u => u.Id == driverId);
+            if (user == null) return false;
+
+            user.IsDeleted = true;
+
+            var driver = await context.Drivers.FirstOrDefaultAsync(d => d.UserId == driverId);
+            if (driver != null)
+            {
+                driver.IsDeleted = true;
+            }
+
+            await context.SaveChangesAsync();
+            return true;
+        }
+
+
+        public async Task<List<DriverListItemDto>> GetActiveDriversAsync()
+        {
+            var now = DateTime.UtcNow;
+
+            return await context.Drivers
+                .Include(d => d.User)
+                .Where(d => !d.IsDeleted) // تجاهل السائقين المحذوفين
+                .Select(d => new DriverListItemDto
+                {
+                    UserId = d.UserId,
+                    Name = d.User.FirstName + " " + d.User.LastName,
+                    PhoneNumber = d.User.PhoneNumber,
+                    ProfilePhotoUrl = d.ProfilePhotoUrl,
+                    Status = d.Status,
+                    LastLat = d.LastLat,
+                    LastLng = d.LastLng,
+                    LastSeenAt = d.LastSeenAt,
+                    IsDeleted = d.IsDeleted,
+                    IsActive = d.User.IsActive,
+                    IsBlocked = context.UserBlocks.Any(b => b.UserId == d.UserId && (b.EndsAt == null || b.EndsAt > now)),
+                    Rating = context.Ratings.Where(r => r.TargetUserId == d.UserId).Select(r => (double?)r.Stars).Average() ?? 0,
+                    RatingCount = context.Ratings.Count(r => r.TargetUserId == d.UserId)
+                })
+                .ToListAsync();
+        }
+
+        /// Used by the admin vehicle-registration dropdown - a vehicle may
+        /// only be assigned to a driver whose `DriverApproval.Status` is
+        /// `approved` (not pending/rejected).
+        public async Task<List<DriverListItemDto>> GetApprovedDriversAsync()
+        {
+            var now = DateTime.UtcNow;
+
+            var approvedDriverIds = context.DriverApprovals
+                .Where(a => a.Status == ApprovalStatus.approved)
+                .Select(a => a.DriverId);
+
+            return await context.Drivers
+                .Include(d => d.User)
+                .Where(d => !d.IsDeleted && approvedDriverIds.Contains(d.UserId))
+                .Select(d => new DriverListItemDto
+                {
+                    UserId = d.UserId,
+                    Name = d.User.FirstName + " " + d.User.LastName,
+                    PhoneNumber = d.User.PhoneNumber,
+                    ProfilePhotoUrl = d.ProfilePhotoUrl,
+                    Status = d.Status,
+                    LastLat = d.LastLat,
+                    LastLng = d.LastLng,
+                    LastSeenAt = d.LastSeenAt,
+                    IsDeleted = d.IsDeleted,
+                    IsActive = d.User.IsActive,
+                    IsBlocked = context.UserBlocks.Any(b => b.UserId == d.UserId && (b.EndsAt == null || b.EndsAt > now)),
+                    Rating = context.Ratings.Where(r => r.TargetUserId == d.UserId).Select(r => (double?)r.Stars).Average() ?? 0,
+                    RatingCount = context.Ratings.Count(r => r.TargetUserId == d.UserId)
+                })
+                .ToListAsync();
+        }
+
+
+        public async Task RestoreDriverAsync(string driverId)
+        {
+            var user = await context.Users
+                                    .IgnoreQueryFilters()
+                                    .FirstOrDefaultAsync(u => u.Id == driverId);
+
+            if (user != null)
+            {
+                user.IsDeleted = false;
+                await context.SaveChangesAsync();
+            }
+
+            var driver = await context.Drivers
+                                      .IgnoreQueryFilters()
+                                      .FirstOrDefaultAsync(d => d.UserId == driverId);
+
+            if (driver != null)
+            {
+                driver.IsDeleted = false;
+                await context.SaveChangesAsync();
+            }
+        }
+
+
+        public async Task<bool> SoftDeletePassengerAsync(string passengerId)
+        {
+            var user = await context.Users.FirstOrDefaultAsync(u => u.Id == passengerId);
+            if (user == null) return false;
+
+            user.IsDeleted = true;
+
+            var passenger = await context.Passengers.FirstOrDefaultAsync(p => p.UserId == passengerId);
+            if (passenger != null)
+            {
+                passenger.IsDeleted = true;
+            }
+
+            await context.SaveChangesAsync();
+            return true;
+        }
+        public async Task<List<PassengerDto>> GetActivePassengersAsync()
+        {
+            var now = DateTime.UtcNow;
+
+            return await context.Passengers
+                .Include(p => p.User) // جلب بيانات المستخدم المرتبط
+                .Where(p => !p.IsDeleted)
+                .Select(p => new PassengerDto
+                {
+                    UserId = p.UserId,
+                    FullName = p.User.FirstName + " " + p.User.LastName,
+                    PhoneNumber = p.User.PhoneNumber ?? string.Empty,
+                    Address = p.Address,
+                    ProfilePhotoUrl = p.ProfilePhotoUrl,
+                    UpdatedAt = p.UpdatedAt,
+                    IsActive = p.User.IsActive,
+                    IsBlocked = context.UserBlocks.Any(b => b.UserId == p.UserId && (b.EndsAt == null || b.EndsAt > now)),
+                    CompletedOrdersCount = p.Orders.Count(o => o.Status == OrderStatus.Completed)
+                })
+                .ToListAsync();
+        }
+
+
+
+        public async Task RestorePassengerAsync(string passengerId)
+        {
+            var user = await context.Users
+                                    .IgnoreQueryFilters()
+                                    .FirstOrDefaultAsync(u => u.Id == passengerId);
+
+            if (user != null)
+            {
+                user.IsDeleted = false;
+                await context.SaveChangesAsync();
+            }
+
+            var passenger = await context.Passengers
+                                         .IgnoreQueryFilters()
+                                         .FirstOrDefaultAsync(p => p.UserId == passengerId);
+
+            if (passenger != null)
+            {
+                passenger.IsDeleted = false;
+                await context.SaveChangesAsync();
+            }
+        }
+
+
+        public async Task<PassengerProfileDto> GetPassengerProfileAsync(string passengerId)
+        {
+            var passenger = await context.Passengers
+                .Include(p => p.User) // إذا عندك علاقة مع جدول Users
+                .Include(p => p.Orders)
+                .FirstOrDefaultAsync(p => p.UserId == passengerId && !p.IsDeleted);
+
+            if (passenger == null) return null;
+
+            var now = DateTime.UtcNow;
+            var isBlocked = await context.UserBlocks
+                .AnyAsync(b => b.UserId == passengerId && (b.EndsAt == null || b.EndsAt > now));
+
+            return new PassengerProfileDto
+            {
+                Id = passenger.UserId,
+                FirstName = passenger.User.FirstName,
+                LastName = passenger.User.LastName,
+                FullName = passenger.User.FirstName + " " + passenger.User.LastName,
+                Address = passenger.User.Address,
+                PhoneNumber = passenger.User.PhoneNumber,
+                ProfileImageUrl = passenger.ProfilePhotoUrl,
+                IsActive = passenger.User.IsActive,
+                IsBlocked = isBlocked,
+                CompletedOrdersCount = passenger.Orders.Count(o => o.Status == OrderStatus.Completed),
+                CreatedAt = passenger.User.CreatedAt
+            };
+        }
+
+
+        public async Task<PagedResult<OrderDto>> GetOrdersAsync(
+   int page,
+  int pageSize,
+  OrderStatus? status,
+  string? search,
+  OrderSortBy? sortBy,
+  bool? ascending,
+  DateTime? fromDate,
+  DateTime? toDate)
+        {
+            if (toDate.HasValue)
+                toDate = toDate.Value.Date.AddDays(1).AddTicks(-1);
+
+            var query = context.Orders
+                .Include(o => o.Passenger)
+                .Include(o => o.TripOrders)
+                .ThenInclude(to => to.Trip)
+                .Include(o => o.Reviews)
+                .AsQueryable();
+
+            // 🔥 Filter by Status
+            if (status.HasValue)
+            {
+                query = query.Where(o => o.Status == status.Value);
+            }
+
+            // 🔍 Search
+            if (!string.IsNullOrEmpty(search))
+            {
+                query = query.Where(o =>
+                    o.Passenger.User.FirstName.Contains(search) ||
+                    o.Passenger.User.LastName.Contains(search) ||
+                    o.PickupLocation.Contains(search) ||
+                    o.DropoffLocation.Contains(search));
+            }
+
+            if (fromDate.HasValue)
+            {
+                query = query.Where(o => o.CreatedAt >= fromDate.Value);
+            }
+
+            if (toDate.HasValue)
+            {
+                query = query.Where(o => o.CreatedAt <= toDate.Value);
+            }
+
+            // 🔃 Sorting
+            query = sortBy switch
+            {
+                OrderSortBy.PassengerName => (ascending ?? true)
+                    ? query.OrderBy(o => o.Passenger.User.FirstName)
+                    : query.OrderByDescending(o => o.Passenger.User.FirstName),
+
+                OrderSortBy.Status => (ascending ?? true)
+                    ? query.OrderBy(o => o.Status)
+                    : query.OrderByDescending(o => o.Status),
+
+                _ => (ascending ?? true)
+                    ? query.OrderBy(o => o.CreatedAt)
+                    : query.OrderByDescending(o => o.CreatedAt)
+            };
+
+            var totalCount = await query.CountAsync();
+
+            var ratings = context.Ratings.AsQueryable();
+
+            var data = await query
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .Select(o => new OrderDto
+                {
+                    OrderId = o.OrderId,
+
+                    PassengerName = o.Passenger.User.FirstName + " " + o.Passenger.User.LastName,
+
+                    PickupLat = o.PickupLat,
+                    PickupLng = o.PickupLng,
+                    PickupLocation = o.PickupLocation,
+                    DropoffLat = o.DropoffLat,
+                    DropoffLng = o.DropoffLng,
+                    DropoffLocation = o.DropoffLocation,
+                    PassengerCount = o.PassengerCount,
+                    Priority = o.Priority,
+                    RequiredVehicleSize = o.RequiredVehicleSize,
+                    Status = o.Status,
+
+                    TripId = o.TripOrders
+                        .Select(t => t.TripId)
+                        .FirstOrDefault(),
+
+                    Rating = ratings
+    .Where(r => r.OrderId == o.OrderId)
+    .Select(r => new OrderRatingDto
+    {
+        Stars = (int?)r.Stars,
+        Comment = r.Comment
+    })
+    .FirstOrDefault(),
+
+                    CreatedAt = o.CreatedAt,
+                    ScheduledAt = o.ScheduledAt
+                })
+                .ToListAsync();
+
+            return new PagedResult<OrderDto>
+            {
+                TotalCount = totalCount,
+                Page = page,
+                PageSize = pageSize,
+                Data = data
+            };
+        }
+
+
+        public async Task<PagedResult<TripDto>> GetTripsAsync(
+    int page,
+    int pageSize,
+    TripStatus? status,
+    string? search,
+    TripSortBy? sortBy,
+    bool? ascending,
+    DateTime? fromDate,
+    DateTime? toDate)
+        {
+
+            if (toDate.HasValue)
+                toDate = toDate.Value.Date.AddDays(1).AddTicks(-1);
+
+            var query = context.Trips
+                .Include(t => t.Driver)
+                    .ThenInclude(d => d.User)
+                .Include(t => t.TripOrders)
+                    .ThenInclude(to => to.Order)
+                        .ThenInclude(o => o.Passenger)
+                .Include(t => t.Ratings)
+                .AsQueryable();
+
+            // 🔥 Filter
+            if (status.HasValue)
+            {
+                query = query.Where(t => t.Status == status.Value);
+            }
+
+            // 🔍 Search
+            if (!string.IsNullOrEmpty(search))
+            {
+                query = query.Where(t =>
+                    t.Driver.User.FirstName.Contains(search) ||
+                    t.Driver.User.LastName.Contains(search));
+            }
+
+            if (fromDate.HasValue)
+            {
+                query = query.Where(t => t.CreatedAt >= fromDate.Value);
+            }
+
+            if (toDate.HasValue)
+            {
+                query = query.Where(t => t.CreatedAt <= toDate.Value);
+            }
+
+            // 🔃 Sorting
+            query = sortBy switch
+            {
+                TripSortBy.DriverName => (ascending ?? true)
+                    ? query.OrderBy(t => t.Driver.User.FirstName)
+                    : query.OrderByDescending(t => t.Driver.User.FirstName),
+
+                TripSortBy.Status => (ascending ?? true)
+                    ? query.OrderBy(t => t.Status)
+                    : query.OrderByDescending(t => t.Status),
+
+                TripSortBy.CreatedAt => (ascending ?? true)
+                    ? query.OrderBy(t => t.CreatedAt)
+                    : query.OrderByDescending(t => t.CreatedAt),
+
+                // sortBy is nullable (TripSortBy?) - null wasn't matched by any
+                // arm above, which is what threw SwitchExpressionException
+                // whenever the caller omitted sortBy. Default to CreatedAt.
+                _ => (ascending ?? true)
+                    ? query.OrderBy(t => t.CreatedAt)
+                    : query.OrderByDescending(t => t.CreatedAt)
+            };
+
+            var totalCount = await query.CountAsync();
+
+            var data = await query
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .Select(t => new TripDto
+                {
+                    TripId = t.TripId,
+                    Status = t.Status,
+
+                    DriverName = t.Driver.User.FirstName + " " + t.Driver.User.LastName,
+
+                    TotalPassengers = t.TripOrders
+                        .Sum(o => o.Order.PassengerCount),
+
+                    // ✅ عدد التقييمات
+                    RatingCount = t.Ratings.Count(),
+
+                    TripRating = t.Ratings
+                        .Select(r => (double?)r.Stars)
+                        .Average() ?? 0,
+
+                    IsActive = t.Status == TripStatus.Assigned ||
+                               t.Status == TripStatus.InProgress,
+
+                    CreatedAt = t.CreatedAt
+                })
+                .ToListAsync();
+
+            return new PagedResult<TripDto>
+            {
+                TotalCount = totalCount,
+                Page = page,
+                PageSize = pageSize,
+                Data = data
+            };
+        }
+
+
+        public async Task<List<TopDriverDto>> GetTopDriversAsync(int top, DateTime? fromDate, DateTime? toDate)
+        {
+            var query = context.Trips
+                .Where(t => t.Status == TripStatus.Completed)
+                .AsQueryable();
+
+            if (fromDate.HasValue)
+                query = query.Where(t => t.CreatedAt >= fromDate.Value.Date);
+
+            if (toDate.HasValue)
+                query = query.Where(t => t.CreatedAt <= toDate.Value.Date.AddDays(1).AddTicks(-1));
+
+            // 🔥 1. جمع violations مرة واحدة (Performance Fix)
+            var violations = await context.Violations
+                .Where(v => v.Status == ViolationStatus.Active)
+                .GroupBy(v => v.DriverId)
+                .Select(g => new
+                {
+                    DriverId = g.Key,
+                    Count = g.Count()
+                })
+                .ToDictionaryAsync(x => x.DriverId, x => x.Count);
+
+            var topDrivers = await query
+         .GroupBy(t => t.DriverId)
+         .Select(g => new
+         {
+             DriverId = g.Key,
+
+             DriverName = g.First().Driver != null && g.First().Driver.User != null
+                 ? g.First().Driver.User.FirstName + " " + g.First().Driver.User.LastName
+                 : "Unknown",
+
+             CompletedTrips = g.Count(),
+
+             AvgRating = g.SelectMany(t => t.Ratings)
+                 .Average(r => (double?)r.Stars) ?? 0
+         })
+         .ToListAsync();
+
+            // 🔥 2. الحساب النهائي داخل memory (أسرع + أذكى)
+            var result = topDrivers
+                .Select(x =>
+                {
+                    violations.TryGetValue(x.DriverId, out int violationCount);
+
+                    var tripsScore = Math.Min(x.CompletedTrips / 50.0, 1);
+                    var ratingScore = x.AvgRating / 5.0;
+                    var violationScore = Math.Pow(1 - Math.Min(violationCount / 10.0, 1), 1.3);
+
+                    var score =
+                        (ratingScore * 0.6) +
+                        (tripsScore * 0.3) +
+                        (violationScore * 0.1);
+
+                    return new TopDriverDto
+                    {
+                        DriverId = x.DriverId,
+                        DriverName = x.DriverName,
+                        CompletedTrips = x.CompletedTrips,
+                        AvgRating = x.AvgRating,
+                        ViolationsCount = violationCount,
+                        Score = score
+                    };
+                })
+                .OrderByDescending(x => x.Score)
+                .Take(top)
+                .ToList();
+
+            return result;
+        }
+
+        public async Task<List<AdminCurrentTripDto>> GetCurrentTripsAsync()
+        {
+            var trips = await context.Trips
+                .Include(t => t.Driver)
+                    .ThenInclude(d => d.User)
+                .Include(t => t.Driver)
+                    .ThenInclude(d => d.Vehicles)
+                .Include(t => t.TripOrders)
+                    .ThenInclude(to => to.Order)
+                        .ThenInclude(o => o.Passenger)
+                            .ThenInclude(p => p.User)
+                .Where(t => t.Status == TripStatus.Assigned ||
+                            t.Status == TripStatus.DriverArrived ||
+                            t.Status == TripStatus.InProgress)
+                .ToListAsync();
+
+            var result = new List<AdminCurrentTripDto>();
+
+            foreach (var t in trips)
+            {
+                var vehicle = t.Driver?.Vehicles.FirstOrDefault(v => v.IsCurrent);
+
+                var activeOrders = t.TripOrders
+                    .Where(o => o.StatusInTrip != TripOrderStatus.Cancelled &&
+                                o.StatusInTrip != TripOrderStatus.Unassigned)
+                    .ToList();
+
+                // `Trip.Status` itself never actually becomes `DriverArrived`
+                // (only `DriverAssignedAsync` does and only `TripOrder.StatusInTrip`
+                // is updated by `DriverArrivedAsync`) - changing that would
+                // require auditing every place that matches on
+                // `Status == Assigned`/`InProgress` (e.g. PickupAsync), which
+                // is exactly the kind of regression risk this feature must
+                // avoid. Deriving "arrived" from the per-order status instead
+                // gives an accurate label without touching that logic at all.
+                var anyDriverArrived = activeOrders.Any(o => o.StatusInTrip == TripOrderStatus.DriverArrived);
+
+                var detailed = t.Status switch
+                {
+                    TripStatus.Assigned when anyDriverArrived => "Arrived at pickup",
+                    TripStatus.Assigned => "Going to passenger",
+                    TripStatus.DriverArrived => "Arrived at pickup",
+                    TripStatus.InProgress => "Passenger picked up",
+                    _ => t.Status.ToString()
+                };
+
+                var dto = new AdminCurrentTripDto
+                {
+                    TripId = t.TripId,
+                    Status = t.Status,
+                    DetailedStatus = detailed,
+
+                    DriverId = t.DriverId,
+                    DriverName = t.Driver?.User != null
+                        ? t.Driver.User.FirstName + " " + t.Driver.User.LastName
+                        : "Unknown",
+                    DriverPhone = t.Driver?.User?.PhoneNumber,
+                    DriverProfilePhotoUrl = t.Driver?.ProfilePhotoUrl,
+                    DriverLastLat = t.Driver?.LastLat,
+                    DriverLastLng = t.Driver?.LastLng,
+                    DriverLastSeenAt = t.Driver?.LastSeenAt,
+
+                    VehiclePlateNumber = vehicle?.PlateNumber,
+                    VehicleMake = vehicle?.Make,
+                    VehicleModel = vehicle?.Model,
+
+                    Orders = activeOrders.Select(o => new AdminCurrentTripOrderDto
+                    {
+                        OrderId = o.OrderId,
+                        PassengerName = o.Order.Passenger?.User != null
+                            ? o.Order.Passenger.User.FirstName + " " + o.Order.Passenger.User.LastName
+                            : "Unknown",
+                        PickupLocation = o.Order.PickupLocation,
+                        PickupLat = o.Order.PickupLat,
+                        PickupLng = o.Order.PickupLng,
+                        DropoffLocation = o.Order.DropoffLocation,
+                        DropoffLat = o.Order.DropoffLat,
+                        DropoffLng = o.Order.DropoffLng,
+                        StatusInTrip = o.StatusInTrip
+                    }).ToList()
+                };
+
+                await EnrichWithRouteAsync(dto, activeOrders);
+
+                result.Add(dto);
+            }
+
+            return result;
+        }
+
+        /// Fills in `RoutePoints`/`Polyline`/`EtaMinutes`/`*DistanceMeters`
+        /// on an already-built `AdminCurrentTripDto`, using the trip's
+        /// single active order (every trip has exactly one since shared/
+        /// pooled trips were removed) and the driver's last known position.
+        /// Best-effort only - distance/ETA fall back to straight-line
+        /// (Haversine) math on a routing-service failure, but `RoutePoints`
+        /// itself never falls back to a straight line: it's either real
+        /// road geometry or empty. Never throws, so one trip's map/API
+        /// hiccup can't take down the whole admin trips list.
+        private async Task EnrichWithRouteAsync(AdminCurrentTripDto dto, List<TripOrder> activeOrders)
+        {
+            try
+            {
+                var primary = activeOrders.FirstOrDefault();
+                if (primary == null) return;
+
+                var order = primary.Order;
+                var headingToDropoff = primary.StatusInTrip == TripOrderStatus.PickedUp;
+
+                double? driverLat = dto.DriverLastLat.HasValue ? (double)dto.DriverLastLat.Value : null;
+                double? driverLng = dto.DriverLastLng.HasValue ? (double)dto.DriverLastLng.Value : null;
+
+                double pickupLat = (double)order.PickupLat!;
+                double pickupLng = (double)order.PickupLng!;
+                double? dropoffLat = order.DropoffLat.HasValue ? (double)order.DropoffLat.Value : null;
+                double? dropoffLng = order.DropoffLng.HasValue ? (double)order.DropoffLng.Value : null;
+
+                if (dropoffLat.HasValue && dropoffLng.HasValue)
+                {
+                    dto.TotalDistanceMeters = GeoUtils.HaversineMeters(
+                        pickupLat, pickupLng, dropoffLat.Value, dropoffLng.Value);
+                }
+
+                // The next physical stop the driver is heading toward right
+                // now - pickup until the passenger is in the car, then the
+                // dropoff.
+                double targetLat = headingToDropoff && dropoffLat.HasValue ? dropoffLat.Value : pickupLat;
+                double targetLng = headingToDropoff && dropoffLng.HasValue ? dropoffLng.Value : pickupLng;
+
+                if (driverLat.HasValue && driverLng.HasValue)
+                {
+                    double remaining = GeoUtils.HaversineMeters(driverLat.Value, driverLng.Value, targetLat, targetLng);
+
+                    // Once picked up, "remaining" is driver -> dropoff
+                    // directly, and "covered" is whatever's left of the
+                    // total once that's subtracted - both expressed in the
+                    // same straight-line terms as TotalDistanceMeters so
+                    // they stay consistent with each other.
+                    dto.RemainingDistanceMeters = remaining;
+                    if (dto.TotalDistanceMeters.HasValue)
+                    {
+                        dto.CoveredDistanceMeters = Math.Max(dto.TotalDistanceMeters.Value - remaining, 0);
+                    }
+
+                    var eta = await mapService.GetETAAsync((decimal)driverLat.Value, (decimal)driverLng.Value, (decimal)targetLat, (decimal)targetLng);
+
+                    dto.EtaMinutes = eta != TimeSpan.MaxValue
+                        ? (int)Math.Ceiling(eta.TotalMinutes)
+                        : (int)Math.Ceiling(remaining / FallbackSpeedMetersPerSecond / 60.0);
+
+                    var waypoints = new List<(double lat, double lng)> { (driverLat.Value, driverLng.Value) };
+                    if (!headingToDropoff)
+                        waypoints.Add((pickupLat, pickupLng));
+                    if (dropoffLat.HasValue && dropoffLng.HasValue)
+                        waypoints.Add((dropoffLat.Value, dropoffLng.Value));
+
+                    if (waypoints.Count >= 2)
+                    {
+                        var polyline = await mapService.GetRoutePolylineAsync(waypoints);
+
+                        if (!string.IsNullOrEmpty(polyline))
+                        {
+                            dto.Polyline = polyline;
+                            dto.RoutePoints = GeoUtils.DecodePolyline(polyline)
+                                .Select(p => new RoutePointDto { Lat = p.Lat, Lng = p.Lng })
+                                .ToList();
+                        }
+
+                        // No `else` straight-line fallback: a route must
+                        // always be real road geometry from the routing
+                        // service, never a straight line between waypoints.
+                        // If the call fails, `RoutePoints` stays empty and
+                        // the admin map simply draws no line for this trip
+                        // until the next poll succeeds.
+                    }
+                }
+            }
+            catch
+            {
+                // Best-effort enrichment only - never let a map/API failure
+                // break the admin trips list.
+            }
+        }
+
+    }
+}

@@ -1,0 +1,24 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vs/
+.idea/
+*.user
+*.suo
+
+# .NET
+bin/
+obj/
+
+# Secrets - do not commit
+**/appsettings.Development.json
+**/appsettings.*.local.json
+**/Certs/*.pfx
+**/*.pfx
+
+# Flutter/Dart
+**/.dart_tool/
+**/.flutter-plugins-dependencies
+**/build/
+**/.pub-cache/
+**/.pub/
